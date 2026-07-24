@@ -3439,6 +3439,85 @@ def test_config_default_dispatch_in_gateway_is_true():
     )
 
 
+# ---------------------------------------------------------------------------
+# notify_in_gateway / dispatch_in_gateway resolver
+# ---------------------------------------------------------------------------
+
+def _kanban_cfg(dispatch=True, notify=None):
+    """Build a kanban config block; omit notify when None (absent)."""
+    kanban = {"dispatch_in_gateway": dispatch}
+    if notify is not None:
+        kanban["notify_in_gateway"] = notify
+    return {"kanban": kanban}
+
+
+def test_resolve_notify_in_gateway_explicit_true():
+    from hermes_cli.config import resolve_notify_in_gateway
+    cfg = _kanban_cfg(dispatch=False, notify=True)
+    assert resolve_notify_in_gateway(cfg) is True
+
+
+def test_resolve_notify_in_gateway_explicit_false():
+    from hermes_cli.config import resolve_notify_in_gateway
+    cfg = _kanban_cfg(dispatch=True, notify=False)
+    assert resolve_notify_in_gateway(cfg) is False
+
+
+def test_resolve_notify_in_gateway_falls_back_to_dispatch_true():
+    """When notify_in_gateway is absent, dispatch_in_gateway=true wins."""
+    from hermes_cli.config import resolve_notify_in_gateway
+    cfg = _kanban_cfg(dispatch=True, notify=None)
+    assert resolve_notify_in_gateway(cfg) is True
+
+
+def test_resolve_notify_in_gateway_falls_back_to_dispatch_false():
+    """When notify_in_gateway is absent, dispatch_in_gateway=false wins."""
+    from hermes_cli.config import resolve_notify_in_gateway
+    cfg = _kanban_cfg(dispatch=False, notify=None)
+    assert resolve_notify_in_gateway(cfg) is False
+
+
+def test_resolve_notify_in_gateway_env_override_disables(monkeypatch):
+    from hermes_cli.config import resolve_notify_in_gateway
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_IN_GATEWAY", "false")
+    cfg = _kanban_cfg(dispatch=True, notify=True)
+    assert resolve_notify_in_gateway(cfg) is False
+
+
+def test_resolve_notify_in_gateway_env_truthy_defers_to_config(monkeypatch):
+    """Truthy env value doesn't force-enable; config still decides."""
+    from hermes_cli.config import resolve_notify_in_gateway
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_IN_GATEWAY", "yes")
+    cfg = _kanban_cfg(dispatch=True, notify=False)
+    assert resolve_notify_in_gateway(cfg) is False
+
+
+def test_resolve_dispatch_in_gateway_config_true():
+    from hermes_cli.config import resolve_dispatch_in_gateway
+    cfg = _kanban_cfg(dispatch=True)
+    assert resolve_dispatch_in_gateway(cfg) is True
+
+
+def test_resolve_dispatch_in_gateway_config_false():
+    from hermes_cli.config import resolve_dispatch_in_gateway
+    cfg = _kanban_cfg(dispatch=False)
+    assert resolve_dispatch_in_gateway(cfg) is False
+
+
+def test_resolve_dispatch_in_gateway_env_override_disables(monkeypatch):
+    from hermes_cli.config import resolve_dispatch_in_gateway
+    monkeypatch.setenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "0")
+    cfg = _kanban_cfg(dispatch=True)
+    assert resolve_dispatch_in_gateway(cfg) is False
+
+
+def test_resolve_dispatch_in_gateway_env_truthy_defers_to_config(monkeypatch):
+    from hermes_cli.config import resolve_dispatch_in_gateway
+    monkeypatch.setenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "yes")
+    cfg = _kanban_cfg(dispatch=False)
+    assert resolve_dispatch_in_gateway(cfg) is False
+
+
 def test_check_dispatcher_presence_silent_when_gateway_running(monkeypatch):
     from hermes_cli import kanban as kb_cli
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)

@@ -131,29 +131,26 @@ class GatewayKanbanWatchersMixin:
         cross boards, so delivery semantics are unchanged — this is
         purely a fan-out of the single-DB poll.
         """
-        # Gate: only the dispatch-owning gateway opens kanban DBs for notifier polling.
-        # Non-dispatch gateways have no subscriptions to deliver — all kanban state lives
-        # in the dispatch owner's per-board DBs. This prevents N-gateway -shm contention.
-        # TODO: gate per-board when per-board dispatcher_owner tracking lands.
+        # Gate: only the notify-owning gateway opens kanban DBs for notifier
+        # polling.  Gated independently from dispatch via
+        # ``notify_in_gateway`` (resolving to ``dispatch_in_gateway`` when
+        # absent, for backward compatibility).  When the notifier owner is a
+        # different profile from the dispatch owner it must still open the
+        # board DBs to find subscriptions — the split decouples DB access
+        # from the dispatch gate.
         try:
             from hermes_cli.config import load_config as _load_config
+            from hermes_cli.config import resolve_notify_in_gateway
         except Exception:
             logger.warning("kanban notifier: config loader unavailable; disabled")
-            return
-        env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
-        if env_override in {"0", "false", "no", "off"}:
-            logger.info("kanban notifier: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
             return
         try:
             cfg = _load_config()
         except Exception as exc:
             logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
             return
-        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
-            logger.info(
-                "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
-            )
+        if not resolve_notify_in_gateway(cfg):
+            logger.info("kanban notifier: disabled (notify_in_gateway resolves false)")
             return
         from gateway.config import Platform as _Platform
         try:
@@ -761,29 +758,24 @@ class GatewayKanbanWatchersMixin:
         """
         # Read config once at boot. If the user flips the flag later, they
         # restart the gateway; same pattern as every other background
-        # watcher here. Honours HERMES_KANBAN_DISPATCH_IN_GATEWAY env var
-        # as an escape hatch (false-y value disables without editing YAML).
+        # watcher here.  Gated via the shared resolver which honours the
+        # ``HERMES_KANBAN_DISPATCH_IN_GATEWAY`` env var as an escape hatch
+        # (false-y value disables without editing YAML).
         try:
             from hermes_cli.config import load_config as _load_config
+            from hermes_cli.config import resolve_dispatch_in_gateway
         except Exception:
             logger.warning("kanban dispatcher: config loader unavailable; disabled")
             return
-        env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
-        if env_override in {"0", "false", "no", "off"}:
-            logger.info("kanban dispatcher: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
-            return
-
         try:
             cfg = _load_config()
         except Exception as exc:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
-        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
-            logger.info(
-                "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
-            )
+        if not resolve_dispatch_in_gateway(cfg):
+            logger.info("kanban dispatcher: disabled (dispatch_in_gateway resolves false)")
             return
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
 
         try:
             from hermes_cli import kanban_db as _kb

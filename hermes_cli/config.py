@@ -2863,6 +2863,16 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Independently control whether the gateway runs the kanban
+        # *notifier* watcher (completion delivery to messaging channels).
+        # When None (default), notifier enablement follows
+        # ``dispatch_in_gateway`` — backward-compatible with pre-split
+        # installs. Set to an explicit bool to decouple: e.g. a dedicated
+        # dispatcher profile with ``dispatch_in_gateway: true`` +
+        # ``notify_in_gateway: false``, and a notifier-only profile with
+        # ``dispatch_in_gateway: false`` + ``notify_in_gateway: true``.
+        # Overridable via the HERMES_KANBAN_NOTIFY_IN_GATEWAY env var.
+        "notify_in_gateway": None,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
@@ -7182,6 +7192,106 @@ def load_config_readonly() -> Dict[str, Any]:
     safety guarantee is purely documented, not enforced — be careful.
     """
     return _load_config_impl(want_deepcopy=False)
+
+
+# ---------------------------------------------------------------------------
+# Kanban dispatch / notify resolver
+# ---------------------------------------------------------------------------
+# Both the gateway notifier watcher and dispatcher watcher need to decide at
+# boot whether they should run.  Historically the notifier piggybacked on the
+# dispatch flag (``dispatch_in_gateway``); the split introduced a dedicated
+# ``notify_in_gateway`` so a non-dispatching gateway (e.g. Sophie) can still
+# deliver task completions.
+#
+# Resolution order for both keys (per the config-layer contract):
+#   1. False-y env-var override — ``HERMES_KANBAN_DISPATCH_IN_GATEWAY`` /
+#      ``HERMES_KANBAN_NOTIFY_IN_GATEWAY``.  An explicit false-y value
+#      (``0``, ``false``, ``no``, ``off``) disables without editing YAML
+#      (escape hatch, mirrors the pre-split gate semantics).
+#   2. Explicit config value — when the user set the key in config.yaml,
+#      that value wins.
+#   3. Truthy env-var override — only when the config key is absent (None).
+#   4. Default / fallback — ``dispatch_in_gateway`` defaults to ``True``.
+#      ``notify_in_gateway`` defaults to ``None``, which means "inherit the
+#      resolved ``dispatch_in_gateway`` value" for backward compatibility.
+_TRUEY = {"1", "true", "yes", "on"}
+_FALSEY = {"0", "false", "no", "off"}
+
+
+def _parse_bool_env(name: str) -> Optional[bool]:
+    """Parse an env var as a tri-state bool.
+
+    Returns ``True`` / ``False`` for recognized true-y / false-y values,
+    ``None`` when the var is unset or holds an unparseable string.
+    """
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in _TRUEY:
+        return True
+    if raw in _FALSEY:
+        return False
+    return None
+
+
+def resolve_dispatch_in_gateway(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return whether this gateway should run the kanban dispatcher.
+
+    Resolution order (highest precedence first):
+    1. ``HERMES_KANBAN_DISPATCH_IN_GATEWAY`` env var — an explicit false-y
+       value (``0``, ``false``, ``no``, ``off``) disables without touching
+       config; this is the escape hatch that works without editing YAML.
+       A truthy/unset value defers to config.
+    2. ``kanban.dispatch_in_gateway`` from the config file (default ``True``).
+    """
+    env_val = _parse_bool_env("HERMES_KANBAN_DISPATCH_IN_GATEWAY")
+    if env_val is False:
+        return False
+    if config is None:
+        try:
+            config = load_config_readonly()
+        except Exception:
+            config = {}
+    kanban_cfg = config.get("kanban", {}) if isinstance(config, dict) else {}
+    raw = kanban_cfg.get("dispatch_in_gateway", None)
+    if raw is not None:
+        return bool(raw)
+    return True
+
+
+def resolve_notify_in_gateway(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return whether this gateway should deliver kanban notifications.
+
+    Resolution order (highest precedence first):
+    1. ``HERMES_KANBAN_NOTIFY_IN_GATEWAY`` env var — an explicit false-y
+       value (``0``, ``false``, ``no``, ``off``) disables without touching
+       config; this is the escape hatch that works without editing YAML
+       (mirrors ``HERMES_KANBAN_DISPATCH_IN_GATEWAY``).
+    2. ``kanban.notify_in_gateway`` from the config file — when explicitly
+       set (``True`` / ``False``) that value wins.
+    3. ``HERMES_KANBAN_NOTIFY_IN_GATEWAY`` env var — a truthy value
+       (``1``, ``true``, ``yes``, ``on``) enables when the config key is
+       absent.
+    4. Fallback: the resolved ``dispatch_in_gateway`` value.  This preserves
+       the historical coupling for any profile that has not opted into the
+       split, so existing installs see no behaviour change.
+    """
+    # Escape hatch: false-y env var disables, regardless of config.
+    env_val = _parse_bool_env("HERMES_KANBAN_NOTIFY_IN_GATEWAY")
+    if env_val is False:
+        return False
+    if config is None:
+        try:
+            config = load_config_readonly()
+        except Exception:
+            config = {}
+    kanban_cfg = config.get("kanban", {}) if isinstance(config, dict) else {}
+    raw = kanban_cfg.get("notify_in_gateway", None)
+    if raw is not None:
+        return bool(raw)
+    # Config key absent — a truthy env var can still enable.
+    if env_val is True:
+        return True
+    # Absent → fall back to the dispatch flag for backward compatibility.
+    return resolve_dispatch_in_gateway(config)
 
 
 def write_platform_config_field(
