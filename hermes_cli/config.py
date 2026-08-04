@@ -2875,15 +2875,18 @@ DEFAULT_CONFIG = {
         # raise these to keep more early failure evidence.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
         "worker_log_backup_count": 1,
+        # Profiles the decomposer may expose to its LLM and assign work to.
+        # Empty/missing fails closed; it never means every installed profile.
+        "decompose_allowed_assignees": [],
         # Profile assigned to the root/orchestration task after Triage
-        # decomposition. When unset, falls back to the default profile (the
-        # one `hermes` launches with no -p flag). This does not control the
+        # decomposition. It must be explicitly configured, included in
+        # decompose_allowed_assignees when needed, and does not control the
         # decomposer prompt, model, or skills; configure that LLM path under
         # auxiliary.kanban_decomposer.
         "orchestrator_profile": "",
         # Where a child task lands if the orchestrator can't match an
-        # assignee to any installed profile. When unset, falls back to the
-        # default profile. A task never ends up with assignee=None.
+        # eligible assignee. It must itself be explicitly allowlisted;
+        # no active-profile fallback is applied.
         "default_assignee": "",
         # Per-profile concurrency cap (#21582). When set to a positive int,
         # no single profile can have more than N workers running at once,

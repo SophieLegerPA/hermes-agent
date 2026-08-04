@@ -11,6 +11,14 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+def _decompose(conn, task_id, *, root_assignee, children, **kwargs):
+    routed = [dict(child, assignee=child.get("assignee") or root_assignee) for child in children]
+    return kb.decompose_triage_task(
+        conn, task_id, routing_assignees={root_assignee, *(c["assignee"] for c in routed)},
+        root_assignee=root_assignee, children=routed, **kwargs,
+    )
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -42,7 +50,7 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
         {"title": "build it", "body": "write code", "assignee": "engineer", "parents": [0]},
     ]
     with kb.connect() as conn:
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn,
             tid,
             root_assignee="orchestrator",
@@ -70,7 +78,7 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
 
 def test_decompose_returns_none_when_task_missing(kanban_home):
     with kb.connect() as conn:
-        result = kb.decompose_triage_task(
+        result = _decompose(
             conn,
             "nonexistent",
             root_assignee="orch",
@@ -83,7 +91,7 @@ def test_decompose_returns_none_when_task_missing(kanban_home):
 def test_decompose_returns_none_when_task_not_in_triage(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="already a real task")  # not triage
-        result = kb.decompose_triage_task(
+        result = _decompose(
             conn,
             tid,
             root_assignee="orch",
@@ -96,7 +104,7 @@ def test_decompose_returns_none_when_task_not_in_triage(kanban_home):
 def test_decompose_empty_children_returns_none(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
-        result = kb.decompose_triage_task(
+        result = _decompose(
             conn,
             tid,
             root_assignee="orch",
@@ -110,7 +118,7 @@ def test_decompose_rejects_self_parent(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
         with pytest.raises(ValueError, match="cannot list itself"):
-            kb.decompose_triage_task(
+            _decompose(
                 conn,
                 tid,
                 root_assignee="orch",
@@ -123,7 +131,7 @@ def test_decompose_rejects_out_of_range_parent(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
         with pytest.raises(ValueError, match="not a valid index"):
-            kb.decompose_triage_task(
+            _decompose(
                 conn,
                 tid,
                 root_assignee="orch",
@@ -136,7 +144,7 @@ def test_decompose_rejects_cyclic_parents(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
         with pytest.raises(ValueError, match="cyclic dependency"):
-            kb.decompose_triage_task(
+            _decompose(
                 conn,
                 tid,
                 root_assignee="orch",
@@ -151,7 +159,7 @@ def test_decompose_rejects_cyclic_parents(kanban_home):
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn,
             tid,
             root_assignee="orch",
@@ -176,7 +184,7 @@ def test_decompose_children_inherit_dir_workspace(kanban_home):
             conn, title="codegen root", assignee="worker",
             workspace_kind="dir", workspace_path=proj, triage=True,
         )
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn, tid, root_assignee="orchestrator",
             children=[{"title": "part A"}, {"title": "part B", "parents": [0]}],
             author="decomposer",
@@ -196,10 +204,11 @@ def test_decompose_children_stay_scratch_when_root_scratch(kanban_home):
             conn, title="scratch root", assignee="worker",
             workspace_kind="scratch", triage=True,
         )
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn, tid, root_assignee="orchestrator",
             children=[{"title": "s1"}], author="decomposer",
         )
+    assert child_ids
     with kb.connect() as conn:
         t = kb.get_task(conn, child_ids[0])
     assert t.workspace_kind == "scratch"
@@ -214,7 +223,7 @@ def test_decompose_per_child_workspace_override(kanban_home):
             conn, title="root", assignee="worker",
             workspace_kind="dir", workspace_path=proj, triage=True,
         )
-        child_ids = kb.decompose_triage_task(
+        child_ids = _decompose(
             conn, tid, root_assignee="orchestrator",
             children=[
                 {"title": "override", "workspace_kind": "dir",
@@ -223,8 +232,23 @@ def test_decompose_per_child_workspace_override(kanban_home):
             ],
             author="decomposer",
         )
+    assert child_ids
     with kb.connect() as conn:
         over = kb.get_task(conn, child_ids[0])
         inh = kb.get_task(conn, child_ids[1])
     assert over.workspace_path == "/other/repo"
     assert inh.workspace_path == proj
+
+
+def test_decompose_routing_proof_rejection_is_no_write(kanban_home):
+    tables = ("tasks", "task_links", "task_comments", "task_events")
+    with kb.connect() as conn:
+        tid = _create_triage(conn, assignee="original")
+        before = {t: [tuple(r) for r in conn.execute(f"SELECT * FROM {t}")] for t in tables}
+        with pytest.raises(ValueError):
+            kb.decompose_triage_task(
+                conn, tid, routing_assignees=["orch"], root_assignee="orch",
+                children=[{"title": "child", "assignee": "worker"}], author="test",
+            )
+        after = {t: [tuple(r) for r in conn.execute(f"SELECT * FROM {t}")] for t in tables}
+    assert after == before

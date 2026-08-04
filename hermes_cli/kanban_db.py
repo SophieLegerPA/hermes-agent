@@ -5320,7 +5320,8 @@ def decompose_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
-    root_assignee: Optional[str],
+    routing_assignees: object,
+    root_assignee: str,
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
@@ -5337,7 +5338,7 @@ def decompose_triage_task(
         {
             "title": "...",
             "body": "...",                     # optional
-            "assignee": "profile-name",        # optional, None -> default fallback
+            "assignee": "profile-name",        # required and in routing proof
             "parents": [0, 2],                 # indices into this same children list
         }
 
@@ -5347,23 +5348,57 @@ def decompose_triage_task(
       - The root task is not in ``triage``
       - A cycle would result (caller built a bad graph)
 
-    Validation of titles/assignees happens inside the same write_txn as
-    the inserts so a malformed entry aborts the whole decomposition
-    cleanly (no orphan children).
+    ``routing_assignees`` is the caller's concrete eligible-profile proof.
+    It, the root assignee, and every child assignee are canonicalized and
+    validated before the write transaction begins.
     """
+    if not isinstance(routing_assignees, (list, tuple, set, frozenset)):
+        raise ValueError("routing_assignees must be a non-empty collection")
+    routing_proof: set[str] = set()
+    from hermes_cli.profiles import validate_profile_name
+    for raw_name in routing_assignees:
+        if not isinstance(raw_name, str):
+            raise ValueError("routing_assignees contains an invalid profile name")
+        name = _canonical_assignee(raw_name)
+        if name is None:
+            raise ValueError("routing_assignees contains an invalid profile name")
+        validate_profile_name(name)
+        if name in routing_proof:
+            raise ValueError("routing_assignees contains a duplicate profile name")
+        routing_proof.add(name)
+    if not routing_proof:
+        raise ValueError("routing_assignees must not be empty")
+    if not isinstance(root_assignee, str):
+        raise ValueError("root_assignee must be concrete")
+    canonical_root = _canonical_assignee(root_assignee)
+    if canonical_root is None:
+        raise ValueError("root_assignee must be concrete")
+    validate_profile_name(canonical_root)
+    if canonical_root not in routing_proof:
+        raise ValueError("root_assignee is outside routing_assignees")
+    root_assignee = canonical_root
     if not children:
         return None
-    if root_assignee is not None:
-        root_assignee = _canonical_assignee(root_assignee)
 
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
+    child_assignees: list[str] = []
     for idx, child in enumerate(children):
         if not isinstance(child, dict):
             raise ValueError(f"child[{idx}] is not a dict")
         title = child.get("title")
         if not isinstance(title, str) or not title.strip():
             raise ValueError(f"child[{idx}].title is required")
+        raw_assignee = child.get("assignee")
+        if not isinstance(raw_assignee, str):
+            raise ValueError(f"child[{idx}].assignee must be concrete")
+        assignee = _canonical_assignee(raw_assignee)
+        if assignee is None:
+            raise ValueError(f"child[{idx}].assignee must be concrete")
+        validate_profile_name(assignee)
+        if assignee not in routing_proof:
+            raise ValueError(f"child[{idx}].assignee is outside routing_assignees")
+        child_assignees.append(assignee)
         parents_idx = child.get("parents") or []
         if not isinstance(parents_idx, list):
             raise ValueError(f"child[{idx}].parents must be a list")
@@ -5433,7 +5468,7 @@ def decompose_triage_task(
             new_id = _new_task_id()
             title = child["title"].strip()
             body = child.get("body")
-            assignee = _canonical_assignee(child.get("assignee"))
+            assignee = child_assignees[idx]
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -5496,12 +5531,8 @@ def decompose_triage_task(
             )
 
         # Flip the root: triage -> todo, set assignee to the orchestrator.
-        sets = ["status = 'todo'"]
-        params: list[Any] = []
-        if root_assignee is not None:
-            sets.append("assignee = ?")
-            params.append(root_assignee)
-        params.append(task_id)
+        sets = ["status = 'todo'", "assignee = ?"]
+        params: list[Any] = [root_assignee, task_id]
         conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
             tuple(params),

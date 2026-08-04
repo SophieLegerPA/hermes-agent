@@ -2299,11 +2299,12 @@ def decompose_task_endpoint(
 
 
 # ---------------------------------------------------------------------------
-# Orchestration settings (kanban.orchestrator_profile / default_assignee /
-# auto_decompose) — surfaced to the dashboard's settings panel
+# Orchestration settings (allowed assignees / orchestrator / default /
+# auto-decompose) — surfaced to the dashboard's settings panel
 # ---------------------------------------------------------------------------
 
 class OrchestrationSettingsBody(BaseModel):
+    decompose_allowed_assignees: Optional[list[str]] = None
     orchestrator_profile: Optional[str] = None
     default_assignee: Optional[str] = None
     auto_decompose: Optional[bool] = None
@@ -2313,43 +2314,35 @@ class OrchestrationSettingsBody(BaseModel):
 @router.get("/orchestration")
 def get_orchestration_settings():
     """Return the current kanban orchestration knobs from config.yaml
-    plus the resolved effective values (filling in fallbacks)."""
+    plus the resolved fail-closed routing values."""
     try:
         from hermes_cli.config import load_config
         cfg = load_config() or {}
     except Exception:
         cfg = {}
     kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
-    explicit_orch = (kanban_cfg.get("orchestrator_profile") or "").strip()
-    explicit_default = (kanban_cfg.get("default_assignee") or "").strip()
+    explicit_allowed = kanban_cfg.get("decompose_allowed_assignees", [])
+    explicit_orch = kanban_cfg.get("orchestrator_profile", "")
+    explicit_default = kanban_cfg.get("default_assignee", "")
     auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
     auto_promote_children = bool(kanban_cfg.get("auto_promote_children", True))
 
-    # Resolve fallbacks the same way the decomposer does.
-    resolved_orch = explicit_orch
-    resolved_default = explicit_default
     try:
-        from hermes_cli import profiles as profiles_mod
-        active_default = profiles_mod.get_active_profile_name() or "default"
-        if not resolved_orch or not profiles_mod.profile_exists(resolved_orch):
-            resolved_orch = active_default
-        if not resolved_default or not profiles_mod.profile_exists(resolved_default):
-            resolved_default = active_default
+        from hermes_cli.kanban_decompose import resolve_routing_policy
+        policy = resolve_routing_policy(cfg)
     except Exception:
-        active_default = "default"
-        if not resolved_orch:
-            resolved_orch = active_default
-        if not resolved_default:
-            resolved_default = active_default
+        policy = None
 
     return {
+        "decompose_allowed_assignees": explicit_allowed,
         "orchestrator_profile": explicit_orch,
         "default_assignee": explicit_default,
         "auto_decompose": auto_decompose,
         "auto_promote_children": auto_promote_children,
-        "resolved_orchestrator_profile": resolved_orch,
-        "resolved_default_assignee": resolved_default,
-        "active_profile": active_default,
+        "resolved_decompose_allowed_assignees": list(policy.allowed) if policy else [],
+        "resolved_orchestrator_profile": policy.root_assignee if policy else None,
+        "resolved_default_assignee": policy.default_assignee if policy else None,
+        "routing_error": policy.error if policy else "decompose-routing-policy-invalid",
     }
 
 
@@ -2358,9 +2351,8 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
     """Update the kanban orchestration knobs in ~/.hermes/config.yaml.
 
     Each field is optional — only fields explicitly passed are
-    written. ``orchestrator_profile`` / ``default_assignee`` accept
-    empty strings to clear the override and fall back to the default
-    profile.
+    written. Empty profile fields clear the override; they never select the
+    active profile implicitly.
     """
     try:
         from hermes_cli.config import load_config, save_config
@@ -2373,40 +2365,20 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
         kanban_section = {}
         cfg["kanban"] = kanban_section
 
-    # Validate any non-empty profile names exist before saving.
-    try:
-        from hermes_cli import profiles as profiles_mod
-    except Exception:
-        profiles_mod = None  # type: ignore
+    if payload.decompose_allowed_assignees is not None:
+        if not payload.decompose_allowed_assignees:
+            raise HTTPException(
+                status_code=400,
+                detail="decompose-routing-policy-missing",
+            )
+        kanban_section["decompose_allowed_assignees"] = payload.decompose_allowed_assignees
 
     if payload.orchestrator_profile is not None:
         name = (payload.orchestrator_profile or "").strip()
-        if name and profiles_mod is not None:
-            try:
-                if not profiles_mod.profile_exists(name):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"profile '{name}' does not exist",
-                    )
-            except HTTPException:
-                raise
-            except Exception:
-                pass  # fail open if the lookup itself errors
         kanban_section["orchestrator_profile"] = name
 
     if payload.default_assignee is not None:
         name = (payload.default_assignee or "").strip()
-        if name and profiles_mod is not None:
-            try:
-                if not profiles_mod.profile_exists(name):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"profile '{name}' does not exist",
-                    )
-            except HTTPException:
-                raise
-            except Exception:
-                pass
         kanban_section["default_assignee"] = name
 
     if payload.auto_decompose is not None:
@@ -2415,8 +2387,29 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
     if payload.auto_promote_children is not None:
         kanban_section["auto_promote_children"] = bool(payload.auto_promote_children)
 
+    from hermes_cli.kanban_decompose import resolve_routing_policy
+    policy = resolve_routing_policy(cfg)
+    explicit_orch = kanban_section.get("orchestrator_profile")
+    explicit_default = kanban_section.get("default_assignee")
+    error = None
+    if policy.error == "decompose-routing-policy-invalid":
+        error = policy.error
+    elif policy.error == "decompose-routing-policy-missing" and (
+        explicit_orch or explicit_default
+    ):
+        error = policy.error
+    elif explicit_orch and explicit_orch not in policy.allowed:
+        error = "decompose-routing-root-invalid"
+    elif explicit_default and explicit_default not in policy.allowed:
+        error = "decompose-routing-default-invalid"
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
     try:
-        save_config(cfg)
+        preserve = {
+            ("kanban", name) for name in payload.model_fields_set
+        }
+        save_config(cfg, preserve_keys=preserve)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"failed to save config: {exc}")
 

@@ -2545,3 +2545,41 @@ def test_dashboard_parent_notice_and_child_results_use_detail_links():
     assert "t.link_counts" not in detail
     assert "Child Results" in detail
     assert "props.data.child_results" in detail
+
+
+def test_orchestration_policy_roundtrip_is_explicit_and_fail_closed(
+    client, kanban_home, monkeypatch,
+):
+    for name in ("orch", "worker", "sophie"):
+        (kanban_home / "profiles" / name).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "sophie")
+    payload = {"decompose_allowed_assignees": ["orch", "worker"],
+               "orchestrator_profile": "orch", "default_assignee": "worker"}
+    response = client.put("/api/plugins/kanban/orchestration", json=payload)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["decompose_allowed_assignees"] == ["orch", "worker"]
+    assert data["resolved_decompose_allowed_assignees"] == ["orch", "worker"]
+    assert data["resolved_orchestrator_profile"] == "orch"
+    assert data["resolved_default_assignee"] == "worker"
+    assert data["routing_error"] is None
+    assert "sophie" not in data["resolved_decompose_allowed_assignees"]
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("hermes_cli.profiles.list_profiles", lambda: (_ for _ in ()).throw(OSError()))
+        failed_read = client.get("/api/plugins/kanban/orchestration").json()
+        assert failed_read["resolved_decompose_allowed_assignees"] == []
+        assert failed_read["routing_error"] == "decompose-routing-policy-invalid"
+        assert client.put("/api/plugins/kanban/orchestration", json={"auto_decompose": False}).status_code == 400
+
+    invalid = [([], "decompose-routing-policy-missing"),
+               (["worker", "worker"], "decompose-routing-policy-invalid"),
+               (["bad/name"], "decompose-routing-policy-invalid"),
+               (["ghost"], "decompose-routing-policy-invalid")]
+    for allowed, reason in invalid:
+        response = client.put(
+            "/api/plugins/kanban/orchestration",
+            json={"decompose_allowed_assignees": allowed},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == reason

@@ -29,9 +29,8 @@ Design notes
   no children created. This makes ``decompose`` a strict superset of
   ``specify`` from the user's perspective.
 
-* If the LLM picks an assignee that doesn't exist as a profile, we
-  rewrite it to the configured ``default_assignee`` (or the default
-  profile if unset). A child task NEVER ends up with ``assignee=None``.
+* Routing is fail-closed: only explicitly allowed, installed profiles enter
+  the prompt or reach the database.
 """
 
 from __future__ import annotations
@@ -136,6 +135,15 @@ class DecomposeOutcome:
     new_title: Optional[str] = None
 
 
+@dataclass
+class RoutingPolicy:
+    allowed: tuple[str, ...] = ()
+    roster: list[dict] | None = None
+    root_assignee: Optional[str] = None
+    default_assignee: Optional[str] = None
+    error: Optional[str] = None
+
+
 def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -177,66 +185,80 @@ def _load_config() -> dict:
         return {}
 
 
-def _resolve_orchestrator_profile(cfg: dict) -> str:
-    """Resolve which profile owns the root/orchestration task after fan-out.
-
-    Falls back to the active default profile when ``kanban.orchestrator_profile``
-    is unset, so a task is never stranded for lack of an orchestrator.
-    """
-    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
-    if explicit:
-        try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
-        except Exception:
-            pass
-    # Fall back to the active default profile.
+def _strict_profile_name(value: object) -> Optional[str]:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return None
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        profiles_mod.validate_profile_name(value)
+    except ValueError:
+        return None
+    return value
+
+
+def resolve_routing_policy(
+    cfg: dict, *, existing_assignee: object = None,
+) -> RoutingPolicy:
+    """Resolve the explicit installed-profile routing proof, fail closed."""
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("kanban"), dict):
+        return RoutingPolicy(error="decompose-routing-policy-missing")
+    kanban_cfg = cfg["kanban"]
+    raw_allowed = kanban_cfg.get("decompose_allowed_assignees")
+    if raw_allowed in (None, []):
+        return RoutingPolicy(error="decompose-routing-policy-missing")
+    if not isinstance(raw_allowed, list):
+        return RoutingPolicy(error="decompose-routing-policy-invalid")
+    allowed: list[str] = []
+    for raw_name in raw_allowed:
+        name = _strict_profile_name(raw_name)
+        if name is None or name in allowed:
+            return RoutingPolicy(error="decompose-routing-policy-invalid")
+        allowed.append(name)
+    try:
+        installed = {p.name: p for p in profiles_mod.list_profiles()}
     except Exception:
-        return "default"
+        return RoutingPolicy(error="decompose-routing-policy-invalid")
+    if any(name not in installed for name in allowed):
+        return RoutingPolicy(error="decompose-routing-policy-invalid")
 
-
-def _resolve_default_assignee(cfg: dict) -> str:
-    """Resolve which profile catches child tasks the orchestrator can't route."""
-    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    explicit = (kanban_cfg.get("default_assignee") or "").strip()
-    if explicit:
-        try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
-        except Exception:
-            pass
-    try:
-        return profiles_mod.get_active_profile_name() or "default"
-    except Exception:
-        return "default"
-
-
-def _build_roster() -> tuple[list[dict], set[str]]:
-    """Return (roster_for_prompt, valid_assignee_names).
-
-    Each roster entry is ``{name, description, has_description}``. The
-    valid-set is used after the LLM responds to rewrite invalid
-    assignees to the default fallback.
-    """
-    roster: list[dict] = []
-    valid: set[str] = set()
-    try:
-        all_profiles = profiles_mod.list_profiles()
-    except Exception as exc:
-        logger.warning("decompose: failed to list profiles: %s", exc)
-        return roster, valid
-    for p in all_profiles:
+    roster = []
+    for name in allowed:
+        p = installed[name]
         desc = (p.description or "").strip()
         roster.append({
-            "name": p.name,
-            "description": desc or f"(no description; profile named {p.name!r})",
+            "name": name,
+            "description": desc or f"(no description; profile named {name!r})",
             "has_description": bool(desc),
         })
-        valid.add(p.name)
-    return roster, valid
+
+    root = None
+    if isinstance(existing_assignee, str):
+        try:
+            candidate = profiles_mod.normalize_profile_name(existing_assignee)
+        except ValueError:
+            candidate = ""
+        if candidate in allowed:
+            root = candidate
+    if root is None:
+        candidate = _strict_profile_name(kanban_cfg.get("orchestrator_profile"))
+        if candidate not in allowed:
+            root_error = "decompose-routing-root-invalid"
+        else:
+            root = candidate
+            root_error = None
+    else:
+        root_error = None
+
+    raw_default = kanban_cfg.get("default_assignee", "")
+    default = None
+    default_error = None
+    if raw_default not in (None, ""):
+        default = _strict_profile_name(raw_default)
+        if default not in allowed:
+            default = None
+            default_error = "decompose-routing-default-invalid"
+    elif not isinstance(raw_default, (str, type(None))):
+        default_error = "decompose-routing-default-invalid"
+    return RoutingPolicy(tuple(allowed), roster, root, default, root_error or default_error)
 
 
 def _format_roster(roster: list[dict]) -> str:
@@ -252,20 +274,22 @@ def _format_roster(roster: list[dict]) -> str:
 def _normalize_assignee_choice(
     assignee: object,
     *,
-    default_assignee: str,
+    default_assignee: Optional[str],
     valid_names: set[str],
-) -> str:
+) -> tuple[Optional[str], Optional[str]]:
     """Return a valid assignee, falling back to ``default_assignee``.
 
     Fan-out children and the single-task fallback should share the same
     routing guarantee: promoted work must not be left unassigned.
     """
-    if not isinstance(assignee, str) or not assignee.strip():
-        return default_assignee
-    chosen = assignee.strip()
+    chosen = _strict_profile_name(assignee)
+    if chosen is None:
+        return (default_assignee, None) if default_assignee else (None, "decompose-routing-default-invalid")
     if chosen not in valid_names:
-        return default_assignee
-    return chosen
+        if default_assignee:
+            return default_assignee, None
+        return None, "decompose-routing-child-out-of-policy"
+    return chosen, None
 
 
 def decompose_task(
@@ -291,11 +315,18 @@ def decompose_task(
         )
 
     cfg = _load_config()
-    orchestrator = _resolve_orchestrator_profile(cfg)
-    default_assignee = _resolve_default_assignee(cfg)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
-    roster, valid_names = _build_roster()
+    policy = resolve_routing_policy(cfg, existing_assignee=task.assignee)
+    if policy.error:
+        return DecomposeOutcome(task_id, False, policy.error)
+    root_assignee = policy.root_assignee
+    if root_assignee is None:
+        return DecomposeOutcome(task_id, False, "decompose-routing-root-invalid")
+    preserve_existing = task.assignee in policy.allowed
+    roster = policy.roster or []
+    valid_names = set(policy.allowed)
+    default_assignee = policy.default_assignee
 
     try:
         from agent.auxiliary_client import call_llm  # type: ignore
@@ -308,7 +339,7 @@ def decompose_task(
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
         roster=_format_roster(roster),
-        default_assignee=default_assignee,
+        default_assignee=default_assignee or "(none configured)",
     )
 
     try:
@@ -350,13 +381,15 @@ def decompose_task(
         new_body = parsed.get("body")
         title_val = new_title.strip() if isinstance(new_title, str) and new_title.strip() else None
         body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
-        assignee_val = None
-        if not task.assignee:
-            assignee_val = _normalize_assignee_choice(
+        assignee_val = root_assignee
+        if not preserve_existing:
+            assignee_val, routing_error = _normalize_assignee_choice(
                 parsed.get("assignee"),
                 default_assignee=default_assignee,
                 valid_names=valid_names,
             )
+            if routing_error:
+                return DecomposeOutcome(task_id, False, routing_error)
         if title_val is None and body_val is None:
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
@@ -385,8 +418,7 @@ def decompose_task(
             task_id, False, "decomposer returned fanout=true with empty tasks list",
         )
 
-    # Rewrite invalid assignees to the default fallback. Never leave a
-    # task with assignee=None — the user explicitly does not want that.
+    # Resolve every child against the proof before entering the DB boundary.
     children: list[dict] = []
     for idx, entry in enumerate(raw_tasks):
         if not isinstance(entry, dict):
@@ -402,11 +434,13 @@ def decompose_task(
         if not isinstance(body, str):
             body = ""
         assignee = entry.get("assignee")
-        chosen = _normalize_assignee_choice(
+        chosen, routing_error = _normalize_assignee_choice(
             assignee,
             default_assignee=default_assignee,
             valid_names=valid_names,
         )
+        if routing_error:
+            return DecomposeOutcome(task_id, False, routing_error)
         if (
             isinstance(assignee, str)
             and assignee.strip()
@@ -434,7 +468,8 @@ def decompose_task(
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
-                root_assignee=orchestrator,
+                routing_assignees=policy.allowed,
+                root_assignee=root_assignee,
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
