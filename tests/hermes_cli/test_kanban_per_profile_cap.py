@@ -5,6 +5,7 @@ gets more than N workers running at once even if the global
 ``max_in_progress`` cap would allow it. Prevents one profile's local
 model / API quota / browser pool from being overwhelmed by a fan-out.
 """
+
 from __future__ import annotations
 
 import os
@@ -22,9 +23,14 @@ def isolated_kanban_home_with_profiles(monkeypatch):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
     for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+        if (
+            mod.startswith("hermes_cli")
+            or mod.startswith("hermes_state")
+            or mod == "hermes_constants"
+        ):
             del sys.modules[mod]
     from hermes_cli import kanban_db
+
     yield kanban_db
 
 
@@ -32,6 +38,77 @@ def _fake_spawn(*args, **kwargs):
     return 12345
 
 
+def test_priority_beats_age_in_ready_scan(isolated_kanban_home_with_profiles):
+    """The dispatcher claims an elevated newer task before an older P0 task."""
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        older = kb.create_task(
+            conn, title="older baseline", assignee="alpha", priority=0
+        )
+        elevated = kb.create_task(
+            conn, title="newer elevated", assignee="alpha", priority=7
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET created_at = 100 WHERE id = ?", (older,))
+            conn.execute("UPDATE tasks SET created_at = 200 WHERE id = ?", (elevated,))
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress_per_profile=1,
+        )
+
+    assert [task_id for task_id, _assignee, _workspace in result.spawned] == [elevated]
+
+
+def test_priority_beats_age_when_elevated_task_is_older(
+    isolated_kanban_home_with_profiles,
+):
+    """An older elevated task still claims before a newer P0 task."""
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        elevated = kb.create_task(
+            conn, title="older elevated", assignee="alpha", priority=7
+        )
+        newer = kb.create_task(
+            conn, title="newer baseline", assignee="alpha", priority=0
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET created_at = 100 WHERE id = ?", (elevated,))
+            conn.execute("UPDATE tasks SET created_at = 200 WHERE id = ?", (newer,))
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress_per_profile=1,
+        )
+
+    assert [task_id for task_id, _assignee, _workspace in result.spawned] == [elevated]
+
+
+def test_created_at_breaks_equal_priority_tie(
+    isolated_kanban_home_with_profiles,
+):
+    """Equal-priority ready tasks claim in ascending created_at order."""
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        older = kb.create_task(
+            conn, title="older elevated", assignee="alpha", priority=7
+        )
+        newer = kb.create_task(
+            conn, title="newer elevated", assignee="alpha", priority=7
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET created_at = 100 WHERE id = ?", (older,))
+            conn.execute("UPDATE tasks SET created_at = 200 WHERE id = ?", (newer,))
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress_per_profile=1,
+        )
+
+    assert [task_id for task_id, _assignee, _workspace in result.spawned] == [older]
 
 
 def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
@@ -46,7 +123,9 @@ def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
             kb.create_task(conn, title=f"b{i}", assignee="beta")
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
-            conn, spawn_fn=_fake_spawn, dry_run=True,
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
             max_in_progress_per_profile=2,
         )
     spawn_assignees = [s[1] for s in res.spawned]
@@ -55,8 +134,6 @@ def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
     assert spawn_assignees.count("beta") == 2
     assert capped_assignees.count("alpha") == 3
     assert capped_assignees.count("beta") == 1
-
-
 
 
 def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_profiles):
@@ -71,7 +148,9 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     # First tick: cap=1, only 1 alpha dispatched
     with kb.connect_closing() as conn:
         res1 = kb.dispatch_once(
-            conn, spawn_fn=_fake_spawn, dry_run=False,
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=False,
             max_in_progress_per_profile=1,
         )
     assert len(res1.spawned) == 1
@@ -90,11 +169,11 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     # Second tick: 1 more alpha should now dispatch
     with kb.connect_closing() as conn:
         res2 = kb.dispatch_once(
-            conn, spawn_fn=_fake_spawn, dry_run=False,
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=False,
             max_in_progress_per_profile=1,
         )
     assert len(res2.spawned) == 1
     assert len(res2.skipped_per_profile_capped) == 1
     assert res2.spawned[0][0] != spawned_id  # different task this time
-
-
