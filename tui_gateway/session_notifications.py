@@ -115,7 +115,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
 # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
-_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+_KANBAN_NOTIFY_KINDS = ("completed", "review_requested", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0  # /loop and /heartbeat share one idle-poll cadence
 
 
@@ -262,6 +262,8 @@ def _kb_timed_out(task, payload: dict, title: str) -> str:
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
 _KANBAN_EVENT_FORMATTERS = {
     "completed": ("✔", _kb_completed),
+    "review_requested": ("?", lambda t, p, title: f" review requested — {title}"
+                         + _kb_first_line(p.get("summary") or "", 200)),
     "blocked": ("⏸", lambda t, p, title: " blocked" + (f": {str(p.get('reason'))[:160]}" if p.get("reason") else "")),
     "gave_up": ("✖", lambda t, p, title: " gave up after repeated spawn failures"
                 + (f"\n{str(p.get('error'))[:200]}" if p.get("error") else "")),
@@ -294,12 +296,13 @@ def _kb_board_key(_kb, board_meta) -> tuple[str, str]:
         return slug, f"slug:{slug}"
 
 
-def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
+def _kb_poll_board(_kb, slug: str, session_key: str, profile_home) -> list:
     """Claim + format this session's unseen events on one board. One poller per live session: the board is not opened
     writable unless it has a subscription owned by this exact session (a failed read-only probe — locked/corrupt DB —
     falls through so delivery is preserved)."""
     from hermes_cli import kanban_db_connect as _kbc
     from hermes_cli import kanban_db_notify as _kbn
+    from hermes_cli.profiles import profile_matches_home
     with contextlib.suppress(Exception):
         if _kbn.count_notify_subs(board=slug, platform="tui", chat_id=session_key) == 0:
             return []
@@ -315,6 +318,9 @@ def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
             return []
         for sub in subs:
             if (sub.get("platform") or "").lower() != "tui" or sub.get("chat_id") != session_key:
+                continue
+            owner = sub.get("notifier_profile")
+            if owner and not profile_matches_home(owner, profile_home):
                 continue
             sub_ident = dict(task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
                              thread_id=sub.get("thread_id") or "")
@@ -356,7 +362,8 @@ def _collect_kanban_notifications(session: dict) -> list:
     unique = {}
     for slug, resolved in (_kb_board_key(_kb, board_meta) for board_meta in boards):
         unique.setdefault(resolved, slug)
-    return [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key)]
+    return [t for slug in unique.values()
+            for t in _kb_poll_board(_kb, slug, session_key, session.get("profile_home"))]
 
 
 def _notif_poll_kanban(sid: str, session: dict) -> None:

@@ -56,6 +56,47 @@ def _sub_rows(tid: str) -> list:
 
 
 class TestCollectKanbanNotifications:
+    def test_each_review_revision_reaches_only_its_origin_once(self):
+        tid = _create_subscribed_task()
+        conn = kbc.connect()
+        try:
+            kb.recompute_ready(conn)
+            for revision in range(3):
+                summary = f"Submission {revision} ready for editorial review"
+                assert kb.request_review(conn, tid, summary=summary)
+                assert _collect_kanban_notifications(_session("other-session")) == []
+
+                texts = _collect_kanban_notifications(_session())
+                assert len(texts) == 1
+                assert tid in texts[0]
+                assert summary in texts[0]
+                assert _collect_kanban_notifications(_session()) == []
+                assert kb.get_task(conn, tid).status == "review"
+
+                if revision < 2:
+                    assert kb.reopen_review_task(conn, tid)
+        finally:
+            conn.close()
+
+    def test_same_session_key_cannot_steal_another_profiles_review(self):
+        from hermes_cli.profiles import get_profile_dir
+
+        tid = _create_subscribed_task()
+        with kbc.connect() as conn:
+            kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=SESSION_KEY,
+                               notifier_profile="sophie")
+            kb.recompute_ready(conn)
+            assert kb.request_review(conn, tid, summary="Sophie must review this submission")
+
+        other = {**_session(), "profile_home": str(get_profile_dir("hemingway"))}
+        assert _collect_kanban_notifications(other) == []
+        owner = {**_session(), "profile_home": str(get_profile_dir("sophie"))}
+        texts = _collect_kanban_notifications(owner)
+        assert len(texts) == 1
+        assert tid in texts[0]
+        assert "Sophie must review this submission" in texts[0]
+        assert _collect_kanban_notifications(owner) == []
+
     def test_zero_sub_board_is_never_opened_writable(self):
         conn = kbc.connect()
         conn.close()
